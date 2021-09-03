@@ -9,4 +9,4 @@ debug: compile
 	gdb ./regExpFA.exe
 
 compile:
-	gcc -g -Wall -std=c99 regExpFA.c -o regExpFA
+	gcc -g -Wall regExpFA.c -o regExpFA

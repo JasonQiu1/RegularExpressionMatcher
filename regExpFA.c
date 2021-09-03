@@ -32,7 +32,7 @@ int numState;
 //  'pOut' points to the next state.
 //  'pOutSplit' points to the other state of a 'Split' state.
 //  'lastListID' is used in append to prevent duplicates in the 
-//	DanglingStateOutList.
+//	DanglingStateOuts.
 typedef struct State State;
 struct State {
     int c;
@@ -50,37 +50,51 @@ enum {
 State*
 pState(int c, State* pOut, State* pOutSplit) {
     numState++;
-    return &(State){ c, pOut, pOutSplit, 0 };
+    State* s = (State*)malloc(sizeof(State));
+    s->c = c;
+    s->pOut = pOut;
+    s->pOutSplit = pOutSplit;
+    s->lastListID = 0;
+    return s;
+    // Why doesn't this work? 'lastListID' becomes junk? Memory not
+    // being allocated properly, seems like.
+    // return &(State){ c, pOut, pOutSplit, 0 };
 }
 
 // Initially holds all states with dangling out pointers for a given fragment 
-typedef union DanglingStateOutList DanglingStateOutList;
-union DanglingStateOutList {
-    DanglingStateOutList* pNext;
+typedef union DanglingStateOuts DanglingStateOuts;
+union DanglingStateOuts {
     State* pOut;
+    DanglingStateOuts* pNext;
 };
 
-// DanglingStateOutList constructor
-DanglingStateOutList*
-danglingStateOutList(State** ppOut) {
-    return &(DanglingStateOutList){ .pOut = *ppOut };
+// DanglingStateOuts constructor. Uses pointer magic to hijack a
+// reference to the state pointer instead of pointing directly to the state.
+DanglingStateOuts*
+pDanglingStateOuts(State** ppOut) {
+    DanglingStateOuts* new = (DanglingStateOuts*)(ppOut);
+    new->pNext = NULL;
+    return new;
 }
 
-// Uses last list ID to prevent duplicates from being appended.
-//DanglingStateOutList*
-//append(DanglingStateOutList* pFirst, DanglingStateOutList* pSecond) {
-//
-//}
+// Appends dangling outs together.
+DanglingStateOuts*
+append(DanglingStateOuts* pFirst, DanglingStateOuts* pSecond) {
+    DanglingStateOuts* res = pFirst;
+    while (pFirst->pNext) pFirst = pFirst->pNext;
+    pFirst->pNext = pSecond;
+    return res;
+}
 
 // Points all the dangling out states in the list to the given state.
 void
-patch(DanglingStateOutList* pList, State* pState) {
-    DanglingStateOutList* pNext;
-    do {
+patch(DanglingStateOuts* pList, State* pState) {
+    DanglingStateOuts* pNext;
+    while(pList) {
         pNext = pList->pNext;
         pList->pOut = pState;
         pList = pNext;
-    } while (pNext);
+    }
 }
 
 //  Initially represents an incomplete state.
@@ -89,12 +103,12 @@ patch(DanglingStateOutList* pList, State* pState) {
 typedef struct Fragment Fragment;
 struct Fragment {
     State* pStart;
-    DanglingStateOutList* pOut;
+    DanglingStateOuts* pOut;
 };
 
 //  Fragment constructor.
 Fragment
-fragment(State* pState, DanglingStateOutList* pOut) {
+fragment(State* pState, DanglingStateOuts* pOut) {
     return (Fragment){ pState, pOut };
 }
 
@@ -204,26 +218,96 @@ regexToPostfix(char* regex) {
     push('\0');
 
     return result;
+    #undef push
+    #undef peekOp 
+    #undef popOp
+    #undef pushOp
+    #undef popOpUntil
+    #undef popOpGreBindings
 }
 
-//State**
-//buildNFA(const char* postfix) {
-//
-//}
+State*
+buildNFA(const char* postfix) {
+    Fragment frags[MAX_STRING_LENGTH], f1, f2;
+    Fragment* pFrags = frags;
+    State* s;
+        
+    #define pop() (*--pFrags)
+    #define push(f) *pFrags++ = f
 
-//int
-//match(char* regex, char* string) {
-//    State** ppStart = buildNFA(regexToPostfix(regex));
-//    for (; *string; string++) {
-//        if (*string == (*ppStart)->c) {
-//
-//        } else {
-//            break;
-//        }
-//    }
-//
-//    return false;
-//}
+    for (; *postfix; postfix++) {
+        switch(*postfix) {
+            case '*':
+                f1 = pop();
+                s = pState(Split, f1.pStart, NULL);
+                patch(f1.pOut, s);
+                push(fragment(s, pDanglingStateOuts(&s->pOutSplit)));
+                break;
+            case '+':
+                f1 = pop();
+                s = pState(Split, f1.pStart, NULL);
+                patch(f1.pOut, s);
+                push(fragment(f1.pStart, 
+                              pDanglingStateOuts(&s->pOutSplit)));
+                break;
+            case '?':
+                f1 = pop();
+                s = pState(Split, f1.pStart, NULL);
+                push(fragment(s, 
+                              append(f1.pOut,
+                                     pDanglingStateOuts(&s->pOutSplit))));
+                break;
+            case CONCAT_OP:
+                f2 = pop();
+                f1 = pop();
+                patch(f1.pOut, f2.pStart);
+                push(fragment(f1.pStart, f2.pOut));
+                break;
+            case '|':
+                f2 = pop();
+                f1 = pop();
+                s = pState(Split, f1.pStart, f2.pStart);
+                push(fragment(s, append(f1.pOut, f2.pOut)));
+                break;
+            default:
+                s = pState(*postfix, NULL, NULL);
+                push(fragment(s, pDanglingStateOuts(&s->pOut))); 
+                break;
+        }
+    }
+
+    f1 = pop();
+    // Bad regex
+    if (pFrags != frags) return NULL;
+
+    // Close the NFA by pointing all dangling outs to match.
+    patch(f1.pOut, pState(Match, NULL, NULL));
+
+    return f1.pStart;
+    #undef pop
+    #undef push
+}
+
+typedef struct {
+    State** s;
+    int len;
+} List;
+
+int
+match(char* regex, char* string) {
+    char* postfix = regexToPostfix(regex);
+    State* pStart = buildNFA(postfix);
+    for (; *string; string++) {
+        if (*string == pStart->c) {
+
+        } else {
+            break;
+        }
+    }
+
+    free(postfix);
+    return 0;
+}
 
 int main() {
     // Get input.
@@ -235,10 +319,7 @@ int main() {
     scanf("%s", string);
 
     numState = 0;
-    char* postfix = regexToPostfix(regex);
-    printf("Postfix: %s\n", postfix);
-    free(postfix);
-    //match(regex, string);
+    match(regex, string);
 
     printf("Done.\n");
     return 0;
