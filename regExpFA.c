@@ -31,8 +31,8 @@ int numState;
 //	state that splits into two states, that may or may not include itself.
 //  'pOut' points to the next state.
 //  'pOutSplit' points to the other state of a 'Split' state.
-//  'lastListID' is used in append to prevent duplicates in the 
-//	DanglingStateOuts.
+//  'lastListID' is used in addState to prevent duplicates when interpreting
+//  the NFA to prevent duplicates.
 typedef struct State State;
 struct State {
     int c;
@@ -226,6 +226,8 @@ regexToPostfix(char* regex) {
     #undef popOpGreBindings
 }
 
+// Builds an NFA from postfix regex.
+// Returns the starting state.
 State*
 buildNFA(const char* postfix) {
     Fragment frags[MAX_STRING_LENGTH], f1, f2;
@@ -288,23 +290,104 @@ buildNFA(const char* postfix) {
     #undef push
 }
 
+// Incrememnt listID when a list is created.
+static int listID = 0;
 typedef struct {
-    State** s;
+    State** ppStates;
     int len;
 } List;
 
+// Empty list constructor.
+List*
+pEmptyList(int size) {
+    List* new = (List*)malloc(sizeof(List));
+    new->ppStates = (State**)malloc(sizeof(State*) * size);
+    new->len = 0;
+    listID++;
+    return new;
+}
+
+// Add a state to the list if it was not already added this step.
+void
+addState(List* l, State* s) {
+    if (s == NULL || s->lastListID == listID) {
+        return;
+    }
+
+    s->lastListID = listID;
+    if (s->c == Split) {
+        addState(l, s->pOut);
+        addState(l, s->pOutSplit);
+    } else {
+        l->ppStates[l->len++] = s;
+    }
+}
+
+// List constructor.
+List*
+pList(State* pStart, int size) {
+    List* new = pEmptyList(size);
+    addState(new, pStart);
+    return new;
+}
+
+// Add the outs of the states in pCurrStates that match c to pNextStates.
+void
+step(List* pCurrStates, List* pNextStates, int c) {
+    int i;
+    State* pCurrState;
+    listID++;
+    pNextStates->len = 0;
+    for (i = 0; i < pCurrStates->len; i++) {
+        pCurrState = pCurrStates->ppStates[i];
+        if (pCurrState->c == '.' || pCurrState->c == c) {
+            addState(pNextStates, pCurrState->pOut);
+        }
+    }
+}
+
+int checkMatch(List* pFinalStates) {
+    int i;
+    for (i = 0; i < pFinalStates->len; i++) {
+        if (pFinalStates->ppStates[i]->c == Match) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Match a regex against a string by building and interpreting an NFA.
 int
 match(char* regex, char* string) {
     char* postfix = regexToPostfix(regex);
-    State* pStart = buildNFA(postfix);
-    for (; *string; string++) {
-        if (*string == pStart->c) {
 
-        } else {
-            break;
+    listID = 0;
+    numState = 0;
+    State* pStart = buildNFA(postfix);
+
+    List* pCurrStates = pList(pStart, numState);
+    List* pNextStates = pEmptyList(numState);
+    List* pTemp;
+
+    for (; *string; string++) {
+        step(pCurrStates, pNextStates, *string);
+        // Break early if no more states to follow.
+        if (!pNextStates->len) {
+            break;    
         }
+        
+        // Avoid reallocating memory by swapping the buffers.
+        pTemp = pCurrStates;
+        pCurrStates = pNextStates;
+        pNextStates = pTemp;
     }
 
+    return checkMatch(pCurrStates);
+
+    // Free all the states too
+
+    free(pCurrStates);
+    free(pNextStates);
     free(postfix);
     return 0;
 }
@@ -318,8 +401,11 @@ int main() {
     printf("Enter string to match:\n");
     scanf("%s", string);
 
-    numState = 0;
-    match(regex, string);
+    if (match(regex, string)) {
+        printf("Match found!\n");
+    } else {
+        printf("Match not found.\n");
+    }
 
     printf("Done.\n");
     return 0;
