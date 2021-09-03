@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 // Keeps track of the number of states to allocate memory when interpreting.
 int numState;
@@ -291,7 +292,7 @@ buildNFA(const char* postfix) {
 }
 
 // Incrememnt listID when a list is created.
-static int listID = 0;
+static int listID;
 typedef struct {
     State** ppStates;
     int len;
@@ -299,12 +300,11 @@ typedef struct {
 
 // Empty list constructor.
 List*
-pEmptyList(int size) {
-    List* new = (List*)malloc(sizeof(List));
-    new->ppStates = (State**)malloc(sizeof(State*) * size);
-    new->len = 0;
+pEmptyList(List* l, int size) {
+    //l->ppStates = (State**)realloc(l->ppStates, sizeof(State*) * size);
+    l->len = 0;
     listID++;
-    return new;
+    return l;
 }
 
 // Add a state to the list if it was not already added this step.
@@ -325,12 +325,15 @@ addState(List* l, State* s) {
 
 // List constructor.
 List*
-pList(State* pStart, int size) {
-    List* new = pEmptyList(size);
-    addState(new, pStart);
-    return new;
+pList(List* l, State* pStart, int size) {
+    pEmptyList(l, size);
+    addState(l, pStart);
+    return l;
 }
 
+// Stores the matching string.
+char* matchedString; 
+int matchLength;
 // Add the outs of the states in pCurrStates that match c to pNextStates.
 void
 step(List* pCurrStates, List* pNextStates, int c) {
@@ -341,6 +344,8 @@ step(List* pCurrStates, List* pNextStates, int c) {
     for (i = 0; i < pCurrStates->len; i++) {
         pCurrState = pCurrStates->ppStates[i];
         if (pCurrState->c == '.' || pCurrState->c == c) {
+            if (pCurrState->c < 256) 
+                matchedString[matchLength++] = pCurrState->c;
             addState(pNextStates, pCurrState->pOut);
         }
     }
@@ -356,6 +361,36 @@ int checkMatch(List* pFinalStates) {
     return 0;
 }
 
+// Holds current and next states in the NFA.
+List* pCurrStates;
+List* pNextStates;
+// Free all states in the NFA by walking through all states.
+void freeStates(State* pStart) {
+    pCurrStates = pList(pCurrStates, pStart, numState);
+    pNextStates = pEmptyList(pNextStates, numState);
+    State* s;
+    int i;
+    List* pTemp;
+
+    while (pCurrStates->len > 0) {
+        for (i = 0; i < pCurrStates->len; i++) {
+            s = pCurrStates->ppStates[i];
+            if (!s) continue;
+
+            addState(pNextStates, s->pOut);
+            if (s->c == Split) {
+                addState(pNextStates, s->pOutSplit);
+            }
+            
+            free(s);
+            s = NULL;
+        }
+        pTemp = pCurrStates;
+        pCurrStates = pNextStates;
+        pNextStates = pTemp;
+    }
+}
+
 // Match a regex against a string by building and interpreting an NFA.
 int
 match(char* regex, char* string) {
@@ -363,10 +398,11 @@ match(char* regex, char* string) {
 
     listID = 0;
     numState = 0;
+    matchLength = 0;
     State* pStart = buildNFA(postfix);
 
-    List* pCurrStates = pList(pStart, numState);
-    List* pNextStates = pEmptyList(numState);
+    pCurrStates = pList(pCurrStates, pStart, numState);
+    pNextStates = pEmptyList(pNextStates, numState);
     List* pTemp;
 
     for (; *string; string++) {
@@ -382,31 +418,80 @@ match(char* regex, char* string) {
         pNextStates = pTemp;
     }
 
-    return checkMatch(pCurrStates);
+    matchedString[matchLength] = '\0';
+    int result = checkMatch(pCurrStates);
 
-    // Free all the states too
-
-    free(pCurrStates);
-    free(pNextStates);
+    // Free memory that may be leaked when trying another match.
     free(postfix);
-    return 0;
+    //freeStates(pStart);
+    return result;
 }
 
-int main() {
-    // Get input.
+void printHelpLine(const char* cmd, const char* desc) {
+    static const char* indent = "  ";
+    printf("%s%-35s%s\n", indent, cmd, desc);
+}
+
+int main(int argc, char* argv[]) {
     char regex[MAX_STRING_LENGTH]; 
     char string[MAX_STRING_LENGTH]; 
-    printf("Enter regular expression:\n");
-    scanf("%s", regex);
-    printf("Enter string to match:\n");
-    scanf("%s", string);
 
-    if (match(regex, string)) {
-        printf("Match found!\n");
+    matchedString = (char*)malloc(sizeof(char) * MAX_STRING_LENGTH);
+    pCurrStates = (List*)malloc(sizeof(List));
+    pCurrStates->ppStates = (State**)malloc(sizeof(State*)*MAX_STRING_LENGTH);
+    pNextStates = (List*)malloc(sizeof(List));
+    pNextStates->ppStates = (State**)malloc(sizeof(State*)*MAX_STRING_LENGTH);
+    // Run interactive mode if no args
+    if (argc == 1) {
+        char doAgain[1]; 
+        do {
+            printf("Enter regular expression:\n");
+            scanf("%s", regex);
+            printf("Enter string to match:\n");
+            scanf("%s", string);
+
+            if (match(regex, string)) {
+                printf("Match found: %s\n", matchedString);
+            } else {
+                printf("Match not found.\n");
+            }
+
+            printf("Again? (y/n): ");
+            scanf("%s", doAgain);
+            printf("\n");
+        } while (strcmp(doAgain,"y") == 0);
+    } else if (argc == 3) {
+        strcpy(regex, argv[1]);
+        strcpy(string, argv[2]);
+        if (match(regex, string)) {
+            printf("%s", matchedString);
+        } 
+    } else if (argc == 4 && strcmp(argv[1], "-f") == 0) {
+        // For regexes on each line of a file, 
+        // group each regex (separated by line break or space), 
+        // and join them with alternation ('|').
+        FILE* regexFile = fopen(argv[2], "r");
+        int len = 0;
+        char re[MAX_STRING_LENGTH];
+        while (fscanf(regexFile, "%s", re) != EOF) {
+            regex[len++] = '(';
+            strcpy(&regex[len], re);
+            len += strlen(re);
+            regex[len++] = ')';
+            regex[len++] = '|';
+        }
+        regex[--len] = '\0';
+        strcpy(string, argv[3]);
+        if (match(regex, string)) {
+            printf("%s", matchedString);
+        } 
     } else {
-        printf("Match not found.\n");
+        printf("Usage: %s [args] <string>\n", argv[0]);
+        printf("Args:");
+        printHelpLine("(no args)", "Interactive mode.");
+        printHelpLine("<regex>", "Match one regex pattern against a string.");
+        printHelpLine("-f <regexFile>", "Match a file of regexes against a string.");
     }
 
-    printf("Done.\n");
     return 0;
 }
