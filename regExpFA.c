@@ -23,96 +23,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Keeps track of the number of states to allocate memory when interpreting.
-int numState;
-
-//  Represents the states in the NFA.
-//  'c' represents the value of the state, which is 0-255 for matching a
-//	character, 256 to represent the 'Match' state, or 257 to represent a
-//	state that splits into two states, that may or may not include itself.
-//  'pOut' points to the next state.
-//  'pOutSplit' points to the other state of a 'Split' state.
-//  'lastListID' is used in addState to prevent duplicates when interpreting
-//  the NFA to prevent duplicates.
-typedef struct State State;
-struct State {
-    int c;
-    State* pOut;
-    State* pOutSplit;
-    int lastListID;
-};
-
-enum {
-    Match = 256,
-    Split = 257
-};
-
-// State constructor
-State*
-pState(int c, State* pOut, State* pOutSplit) {
-    numState++;
-    State* s = (State*)malloc(sizeof(State));
-    s->c = c;
-    s->pOut = pOut;
-    s->pOutSplit = pOutSplit;
-    s->lastListID = 0;
-    return s;
-    // Why doesn't this work? 'lastListID' becomes junk? Memory not
-    // being allocated properly, seems like.
-    // return &(State){ c, pOut, pOutSplit, 0 };
-}
-
-// Initially holds all states with dangling out pointers for a given fragment 
-typedef union DanglingStateOuts DanglingStateOuts;
-union DanglingStateOuts {
-    State* pOut;
-    DanglingStateOuts* pNext;
-};
-
-// DanglingStateOuts constructor. Uses pointer magic to hijack a
-// reference to the state pointer instead of pointing directly to the state.
-DanglingStateOuts*
-pDanglingStateOuts(State** ppOut) {
-    DanglingStateOuts* new = (DanglingStateOuts*)(ppOut);
-    new->pNext = NULL;
-    return new;
-}
-
-// Appends dangling outs together.
-DanglingStateOuts*
-append(DanglingStateOuts* pFirst, DanglingStateOuts* pSecond) {
-    DanglingStateOuts* res = pFirst;
-    while (pFirst->pNext) pFirst = pFirst->pNext;
-    pFirst->pNext = pSecond;
-    return res;
-}
-
-// Points all the dangling out states in the list to the given state.
-void
-patch(DanglingStateOuts* pList, State* pState) {
-    DanglingStateOuts* pNext;
-    while(pList) {
-        pNext = pList->pNext;
-        pList->pOut = pState;
-        pList = pNext;
-    }
-}
-
-//  Initially represents an incomplete state.
-//  'pStart' points to the starting state of the fragment.
-//  'pOut' points to the state pointers waiting to be filled using patch.
-typedef struct Fragment Fragment;
-struct Fragment {
-    State* pStart;
-    DanglingStateOuts* pOut;
-};
-
-//  Fragment constructor.
-Fragment
-fragment(State* pState, DanglingStateOuts* pOut) {
-    return (Fragment){ pState, pOut };
-}
-
 // Character used as the concatenation operator for conversion to postfix.
 #define CONCAT_OP '%'
 
@@ -169,6 +79,13 @@ regexToPostfix(char* regex) {
     #define popOpGreBindings(op) \
         while (getBinding(peekOp()) >= getBinding(op)) push(popOp())
 
+    // Adds a concatentation operator if the previous character is appropriate.
+    #define ADD_CONCAT \
+        if (prevC != '|' && prevC != '(')  { \
+            popOpGreBindings(CONCAT_OP); \
+            pushOp(CONCAT_OP); \
+        }
+
     char prevC = '|';
     for (; *regex; regex++) {
         switch(*regex) {
@@ -183,29 +100,54 @@ regexToPostfix(char* regex) {
                 pushOp(*regex);
                 break;
             case CONCAT_OP:
+                // Add actual CONCAT_OP if needed
+                ADD_CONCAT
                 // Escape regular CONCAT_OP characters.
-                push('\\');
+                push(92); // push literal backslash
                 push(CONCAT_OP);
+                break;
+            // Groups.
+            case '(':
+                // Make sure groups are also concatenated.
+                ADD_CONCAT
+                pushOp(*regex);
                 break;
             case ')':
                 // Flush op stack until start of group is popped.
                 popOpUntil('(');
                 popOp();
                 break;
-            case '(':
-                // Make sure groups are also concatenated.
-                if (prevC != '|' && prevC != '(')  {
-                    popOpGreBindings(CONCAT_OP);
-                    pushOp(CONCAT_OP);
+            // Character classes.
+            // Reads until ']' is found. It is handled more appropriately
+            // in buildNFA.
+            // [a-zA-Z0-9]-> [az[AZ|[09|.
+            case '[':
+                // Make sure concatting with previous char if needed.
+                ADD_CONCAT
+                regex++;
+                {
+                    char isFirst = 1;
+                    while (*regex != ']') {
+                        push('[');
+                        push(*regex);
+                        regex++;
+                        push(*++regex);
+                        regex++;
+                        if (isFirst) {
+                            isFirst = 0;
+                        } else {
+                            push('|');
+                        }
+                    }
                 }
-                pushOp(*regex);
                 break;
-            // Adds a concat operator if the previous character is not '|'.
+            // Don't concatenate escape characters.
+            case '\\':
+                push(*regex);
+                break;
+            // Adds a concat operator if needed.
             default:
-                if (prevC != '|' && prevC != '(')  {
-                    popOpGreBindings(CONCAT_OP);
-                    pushOp(CONCAT_OP);
-                }
+                ADD_CONCAT
                 push(*regex);
                 break; 
         }
@@ -217,6 +159,8 @@ regexToPostfix(char* regex) {
 
     // Append the null terminator.
     push('\0');
+    // Append a second one to end the string when checking for end of string.
+    push('\0');
 
     return result;
     #undef push
@@ -225,6 +169,105 @@ regexToPostfix(char* regex) {
     #undef pushOp
     #undef popOpUntil
     #undef popOpGreBindings
+}
+
+// Keeps track of the number of states to allocate memory when interpreting.
+int numState;
+
+//  Represents the states in the NFA.
+//  'c' represents the value of the state, which is 0-255 for matching a
+//	    character, 256 to represent the 'Match' state, or 257 to represent a
+//	    state that splits into two states, that may or may not include itself.
+//	'cEnd' represents the end of the range of accepted values.
+//  'pOut' points to the next state.
+//  'pOutSplit' points to the other state of a 'Split' state.
+//  'lastListID' is used in addState to prevent duplicates when interpreting
+//  the NFA to prevent duplicates.
+typedef struct State State;
+struct State {
+    // To implement actual character classes instead of just ranges, change this to a 258-bit bitmap.
+    int c;
+    int cEnd;
+    State* pOut;
+    State* pOutSplit;
+    int lastListID;
+};
+
+enum {
+    Match = 256,
+    Split = 257
+};
+
+// State constructor
+State*
+pStateRange(int c, int cEnd, State* pOut, State* pOutSplit) {
+    numState++;
+    State* s = (State*)malloc(sizeof(State));
+    s->c = c;
+    s->cEnd = cEnd;
+    s->pOut = pOut;
+    s->pOutSplit = pOutSplit;
+    s->lastListID = 0;
+    return s;
+    // Why doesn't this work? 'lastListID' becomes junk? Memory not
+    // being allocated properly, seems like.
+    // return &(State){ c, pOut, pOutSplit, 0 };
+}
+
+State*
+pState(int c, State* pOut, State* pOutSplit) {
+    return pStateRange(c, c, pOut, pOutSplit);
+}
+
+// Initially holds all states with dangling out pointers for a given fragment 
+typedef union DanglingStateOuts DanglingStateOuts;
+union DanglingStateOuts {
+    State* pOut;
+    DanglingStateOuts* pNext;
+};
+
+// DanglingStateOuts constructor. Uses pointer magic to hijack a
+// reference to the state pointer instead of pointing directly to the state.
+DanglingStateOuts*
+pDanglingStateOuts(State** ppOut) {
+    DanglingStateOuts* new = (DanglingStateOuts*)(ppOut);
+    new->pNext = NULL;
+    return new;
+}
+
+// Appends dangling outs together.
+DanglingStateOuts*
+append(DanglingStateOuts* pFirst, DanglingStateOuts* pSecond) {
+    DanglingStateOuts* res = pFirst;
+    while (pFirst->pNext) pFirst = pFirst->pNext;
+    pFirst->pNext = pSecond;
+    return res;
+}
+
+// Points all the dangling out states in the list to the given state.
+void
+patch(DanglingStateOuts* pList, State* pState) {
+    DanglingStateOuts* pNext;
+    while(pList) {
+        pNext = pList->pNext;
+        pList->pOut = pState;
+        pList = pNext;
+    }
+}
+
+//  Initially represents an incomplete state.
+//  'pStart' points to the starting state of the fragment.
+//  'pOut' points to the state pointers waiting to be filled using patch.
+typedef struct Fragment Fragment;
+struct Fragment {
+    State* pStart;
+    DanglingStateOuts* pOut;
+};
+
+//  Fragment constructor.
+Fragment
+fragment(State* pState, DanglingStateOuts* pOut) {
+    return (Fragment){ pState, pOut };
 }
 
 // Builds an NFA from postfix regex.
@@ -272,8 +315,33 @@ buildNFA(const char* postfix) {
                 s = pState(Split, f1.pStart, f2.pStart);
                 push(fragment(s, append(f1.pOut, f2.pOut)));
                 break;
+            // Treat escaped characters as literal characters 
+            // and let them fall-through.
+            case '\\':
+                postfix++;
+                // Intentional fall-through.
             default:
-                s = pState(*postfix, NULL, NULL);
+                switch(*postfix) {
+                    case '.':
+                        s = pStateRange(0, 255, NULL, NULL);
+                        break;
+                    // Character classes of form [a-z]
+                    case '[': 
+                        {
+                            int startChar = *++postfix;
+                            s = pStateRange(startChar, *++postfix, NULL, NULL);
+                            break;
+                        }
+                    case '^':
+                        s = pStateRange((*postfix)+1, *postfix, NULL, NULL);
+                        break;
+                    case '$':
+                        s = pStateRange((*postfix)+1, *postfix, NULL, NULL);
+                        break;
+                    default:
+                        s = pState(*postfix, NULL, NULL);
+                        break;
+                }
                 push(fragment(s, pDanglingStateOuts(&s->pOut))); 
                 break;
         }
@@ -301,7 +369,7 @@ typedef struct {
 // Empty list constructor.
 List*
 pEmptyList(List* l, int size) {
-    //l->ppStates = (State**)realloc(l->ppStates, sizeof(State*) * size);
+    l->ppStates = (State**)realloc(l->ppStates, sizeof(State*) * size);
     l->len = 0;
     listID++;
     return l;
@@ -335,20 +403,50 @@ pList(List* l, State* pStart, int size) {
 char* matchedString; 
 int matchLength;
 // Add the outs of the states in pCurrStates that match c to pNextStates.
-void
-step(List* pCurrStates, List* pNextStates, int c) {
+int
+step(List* pCurrStates, List* pNextStates, char** pStr, int sInd) {
+    int c = *(*pStr)++;
     int i;
+    int matched = 0;
+    int match;
     State* pCurrState;
     listID++;
     pNextStates->len = 0;
     for (i = 0; i < pCurrStates->len; i++) {
+        match = 0;
         pCurrState = pCurrStates->ppStates[i];
-        if (pCurrState->c == '.' || pCurrState->c == c) {
-            if (pCurrState->c < 256) 
-                matchedString[matchLength++] = pCurrState->c;
+        // c should normally be less or equal to cEnd.
+        // If not, then it must be a special operator (^, $, etc.)
+        if (pCurrState->c > pCurrState->cEnd) {
+            // Do not consume any string characters if matched a special char.
+            // Unless it is the last character in the string to prevent 
+            //   infinite looping.
+            //(*pStr)--;
+
+            switch(pCurrState->cEnd) {
+                case '^':
+                    if (sInd == 0) match = 1;
+                    break;
+                case '$':
+                    if (c == 0) match = 1;
+                    break;
+                // Something's gone wrong.
+                default:
+                    printf("Please enter character ranges from smaller \
+                            to larger ASCII code.\n");
+                    exit(-1);
+            }
+        } else if (c >= pCurrState->c && c <= pCurrState->cEnd) {
+            match = 1;
+            if (c < 256) matchedString[matchLength++] = c;
+        }
+
+        if (match)  {
+            matched = 1;
             addState(pNextStates, pCurrState->pOut);
         }
     }
+    return matched;
 }
 
 int checkMatch(List* pFinalStates) {
@@ -405,17 +503,23 @@ match(char* regex, char* string) {
     pNextStates = pEmptyList(pNextStates, numState);
     List* pTemp;
 
-    for (; *string; string++) {
-        step(pCurrStates, pNextStates, *string);
+    // let step advance the character pointer
+    int i = 0;
+    int reachedEnd = 0;
+    int loop = 1;
+    while (loop) {
         // Break early if no more states to follow.
-        if (!pNextStates->len) {
-            break;    
+        if (!step(pCurrStates, pNextStates, &string, i)) {
+            break;
         }
         
         // Avoid reallocating memory by swapping the buffers.
         pTemp = pCurrStates;
         pCurrStates = pNextStates;
         pNextStates = pTemp;
+        i++;
+        if (reachedEnd) loop = 1;
+        if (!*string) reachedEnd = 1;
     }
 
     matchedString[matchLength] = '\0';
